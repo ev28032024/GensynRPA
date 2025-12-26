@@ -1,0 +1,28 @@
+# AdsPower Configuration
+adspower:
+  api_url: "http://local.adspower.net:50325"
+
+# Google Sheets Configuration
+google_sheets:
+  credentials_file: "credentials.json"
+  spreadsheet_name: "GensynFaucet"  # Имя таблицы или spreadsheet_id
+  worksheet_name: "Sheet1"
+
+# Column Mapping (1-indexed, соответствует буквам A, B, C...)
+columns:
+  profile_number: 1    # A - Profile Number (serial_number)
+  address: 2           # B - Wallet Address
+  date_work: 3         # C - Date of last work
+  yes_no_work: 4       # D - Yes/No (can work?)
+  kol_vo_zapros: 5     # E - Request count
+  status: 6            # F - Status (OK/Error)
+
+# Automation Settings
+automation:
+  retry_count: 3                # Количество попыток при ошибке
+  page_load_timeout: 30000      # Таймаут загрузки страницы (мс)
+  action_delay: 2000            # Задержка между действиями (мс)
+  cooldown_hours: 24            # Часов между запросами
+
+# Faucet URL
+faucet_url: "https://www.alchemy.com/faucets/gensyn-testnet"

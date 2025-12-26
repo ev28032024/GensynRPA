@@ -1,0 +1,4 @@
+patchright
+gspread
+pyyaml
+aiohttp
