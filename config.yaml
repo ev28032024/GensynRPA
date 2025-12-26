@@ -13,9 +13,8 @@ columns:
   profile_number: 1    # A - Profile Number (serial_number)
   address: 2           # B - Wallet Address
   date_work: 3         # C - Date of last work
-  yes_no_work: 4       # D - Yes/No (can work?)
-  kol_vo_zapros: 5     # E - Request count
-  status: 6            # F - Status (OK/Error)
+  kol_vo_zapros: 4     # E - Request count
+  status: 5            # F - Status (OK/Error)
 
 # Automation Settings
 automation:

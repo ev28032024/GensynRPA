@@ -1,6 +1,8 @@
 """Main orchestrator for Gensyn Faucet Automation."""
 
 import asyncio
+import signal
+import sys
 import yaml
 from pathlib import Path
 from patchright.async_api import async_playwright
@@ -12,6 +14,9 @@ from src.utils import setup_logging
 
 
 logger = setup_logging("GensynRPA")
+
+# Global flag for graceful shutdown
+shutdown_requested = False
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -88,6 +93,20 @@ async def process_profile(
         # Perform faucet claim
         success, message = await faucet.claim_faucet(page, wallet_address)
         
+        # Handle special COOLDOWN status
+        if message.startswith("COOLDOWN:"):
+            calculated_date = message.split(":", 1)[1] if ":" in message else None
+            if calculated_date == "unknown":
+                calculated_date = None
+            logger.info(f"⏰ Profile already used, updating with calculated date: {calculated_date}")
+            
+            # Update with calculated date if available (don't touch kol-vo)
+            sheets.update_profile_with_cooldown(
+                row=row,
+                calculated_date=calculated_date
+            )
+            return False
+        
         # Update spreadsheet
         sheets.update_profile_result(
             row=row,
@@ -148,11 +167,7 @@ async def main():
     sheets = SheetsManager(config)
     faucet = FaucetAutomation(config)
     
-    # Update yes/no status based on current time
-    logger.info("Updating cooldown status for all profiles...")
-    sheets.update_yes_no_column()
-    
-    # Get profiles to process
+    # Get profiles to process (cooldown is checked automatically)
     profiles = sheets.get_profiles_to_process()
     
     if not profiles:
@@ -165,32 +180,41 @@ async def main():
     total = len(profiles)
     success_count = 0
     error_count = 0
+    cooldown_count = 0
     
     # Start Playwright
-    async with async_playwright() as playwright:
-        for i, profile in enumerate(profiles, 1):
-            logger.info(f"\n[{i}/{total}] Processing...")
-            
-            try:
-                success = await process_profile(
-                    adspower=adspower,
-                    faucet=faucet,
-                    sheets=sheets,
-                    profile=profile,
-                    playwright_instance=playwright
-                )
+    try:
+        async with async_playwright() as playwright:
+            for i, profile in enumerate(profiles, 1):
+                # Check for shutdown request
+                if shutdown_requested:
+                    logger.info("\n⚠️ Shutdown requested, stopping...")
+                    break
                 
-                if success:
-                    success_count += 1
-                else:
-                    error_count += 1
+                logger.info(f"\n[{i}/{total}] Processing...")
+                
+                try:
+                    success = await process_profile(
+                        adspower=adspower,
+                        faucet=faucet,
+                        sheets=sheets,
+                        profile=profile,
+                        playwright_instance=playwright
+                    )
                     
-            except KeyboardInterrupt:
-                logger.info("\nInterrupted by user")
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-                error_count += 1
+                    if success:
+                        success_count += 1
+                    else:
+                        error_count += 1
+                        
+                except KeyboardInterrupt:
+                    logger.info("\n⚠️ Interrupted by user")
+                    break
+                except Exception as e:
+                    logger.error(f"Unexpected error: {e}")
+                    error_count += 1
+    except KeyboardInterrupt:
+        logger.info("\n⚠️ Interrupted by user")
     
     # Close AdsPower session
     await adspower.close()
@@ -205,5 +229,19 @@ async def main():
     logger.info("=" * 60)
 
 
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully."""
+    global shutdown_requested
+    shutdown_requested = True
+    logger.info("\n⚠️ Ctrl+C received, finishing current profile...")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Setup signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("\n👋 Goodbye!")
+        sys.exit(0)

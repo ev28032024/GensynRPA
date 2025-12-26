@@ -1,9 +1,11 @@
 """Faucet automation logic for Gensyn Testnet."""
 
 import asyncio
-from typing import Tuple
+import re
+from datetime import datetime, timedelta
+from typing import Tuple, Optional
 from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
-from src.utils import setup_logging
+from src.utils import setup_logging, format_date
 
 
 logger = setup_logging("FaucetAutomation")
@@ -15,6 +17,7 @@ class FaucetAutomation:
     # Selectors
     WALLET_INPUT = "input#wallet-address"
     SEND_BUTTON = "button:has-text('Send 0.1 ETH')"
+    COOLDOWN_BUTTON = "button:has-text('Come back in')"
     SUCCESS_MESSAGE = "text='Transaction successful'"
     SUCCESS_CONTAINER = "text='Your 0.1 ETH has been successfully sent!'"
     ERROR_MESSAGE = "p.text-red-600"
@@ -95,6 +98,93 @@ class FaucetAutomation:
             logger.warning(f"Error checking for success: {e}")
             return False
     
+    async def _check_for_cooldown(self, page: Page) -> Tuple[bool, Optional[str]]:
+        """
+        Check if there's a cooldown timer on the page.
+        Parses 'Come back in Xh Ym Zs' and calculates last work time.
+        
+        Returns:
+            (has_cooldown: bool, calculated_date_work: str or None)
+        """
+        try:
+            cooldown_button = page.locator(self.COOLDOWN_BUTTON)
+            
+            if await cooldown_button.count() > 0:
+                button_text = await cooldown_button.first.text_content()
+                logger.info(f"Cooldown detected: {button_text}")
+                
+                if button_text:
+                    # Parse "Come back in 23h 11m 49s" format
+                    # Extract hours, minutes, seconds
+                    hours = 0
+                    minutes = 0
+                    seconds = 0
+                    
+                    h_match = re.search(r'(\d+)h', button_text)
+                    m_match = re.search(r'(\d+)m', button_text)
+                    s_match = re.search(r'(\d+)s', button_text)
+                    
+                    if h_match:
+                        hours = int(h_match.group(1))
+                    if m_match:
+                        minutes = int(m_match.group(1))
+                    if s_match:
+                        seconds = int(s_match.group(1))
+                    
+                    # Calculate remaining cooldown
+                    remaining = timedelta(hours=hours, minutes=minutes, seconds=seconds)
+                    
+                    # Cooldown is 24 hours, so last work was (24h - remaining) ago
+                    cooldown_total = timedelta(hours=24)
+                    time_since_last_work = cooldown_total - remaining
+                    
+                    # Calculate last work datetime
+                    last_work_time = datetime.now() - time_since_last_work
+                    last_work_str = format_date(last_work_time)
+                    
+                    logger.info(f"Calculated last work time: {last_work_str}")
+                    return True, last_work_str
+                
+                return True, None
+            
+            return False, None
+        except Exception as e:
+            logger.warning(f"Error checking for cooldown: {e}")
+            return False, None
+    
+    def _parse_rate_limit_date(self, error_msg: str) -> Optional[str]:
+        """
+        Parse rate limit error message to extract datetime.
+        Example: 'Try again after 2025-12-27T10:16:22.424Z'
+        
+        Returns:
+            Calculated date_work string in local time or None
+        """
+        try:
+            # Find ISO datetime in the message (UTC time, indicated by Z)
+            match = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', error_msg)
+            if match:
+                date_str = match.group(1)
+                # Parse the datetime as UTC
+                retry_after_utc = datetime.fromisoformat(date_str)
+                
+                # Convert UTC to local time
+                # Get local timezone offset
+                from datetime import timezone
+                local_offset = datetime.now().astimezone().utcoffset()
+                retry_after_local = retry_after_utc + local_offset
+                
+                # Last work was 24 hours before retry_after
+                last_work_time = retry_after_local - timedelta(hours=24)
+                result = format_date(last_work_time)
+                
+                logger.info(f"Parsed rate limit: retry_after_utc={date_str}, last_work_local={result}")
+                return result
+        except Exception as e:
+            logger.warning(f"Error parsing rate limit date: {e}")
+        
+        return None
+
     async def claim_faucet(self, page: Page, wallet_address: str) -> Tuple[bool, str]:
         """
         Perform faucet claim for a wallet address.
@@ -124,6 +214,16 @@ class FaucetAutomation:
                 wallet_input = page.locator(self.WALLET_INPUT)
                 await wallet_input.wait_for(state="visible", timeout=15000)
                 
+                # Check for cooldown timer FIRST (visible before entering wallet)
+                await asyncio.sleep(1)  # Give time for button to render
+                has_cooldown, calculated_date = await self._check_for_cooldown(page)
+                if has_cooldown:
+                    if calculated_date:
+                        logger.info(f"⏰ Cooldown active, calculated last work: {calculated_date}")
+                        return False, f"COOLDOWN:{calculated_date}"
+                    else:
+                        return False, "COOLDOWN:unknown"
+                
                 # Delay before interaction
                 await asyncio.sleep(self.action_delay / 1000)
                 
@@ -140,10 +240,13 @@ class FaucetAutomation:
                     logger.warning(f"Error after entering address: {error_msg}")
                     last_error = error_msg
                     
-                    # If rate limit, no point retrying
+                    # If rate limit, parse date and return as COOLDOWN
                     if "rate limit" in error_msg.lower() or "24 hour" in error_msg.lower():
-                        logger.info("Rate limit detected, skipping retries")
-                        return False, error_msg
+                        logger.info("Rate limit detected, parsing date...")
+                        calculated_date = self._parse_rate_limit_date(error_msg)
+                        if calculated_date:
+                            return False, f"COOLDOWN:{calculated_date}"
+                        return False, "COOLDOWN:unknown"
                     
                     continue
                 
@@ -173,9 +276,13 @@ class FaucetAutomation:
                     logger.warning(f"Error after clicking send: {error_msg}")
                     last_error = error_msg
                     
-                    # If rate limit or CAPTCHA, handle specially
+                    # If rate limit, parse date and return as COOLDOWN
                     if "rate limit" in error_msg.lower() or "24 hour" in error_msg.lower():
-                        return False, error_msg
+                        logger.info("Rate limit detected after send, parsing date...")
+                        calculated_date = self._parse_rate_limit_date(error_msg)
+                        if calculated_date:
+                            return False, f"COOLDOWN:{calculated_date}"
+                        return False, "COOLDOWN:unknown"
                     
                     if "captcha" in error_msg.lower():
                         logger.info("CAPTCHA error, will retry...")
